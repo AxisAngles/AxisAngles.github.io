@@ -11,6 +11,71 @@
 hello, world!
 I make Roblox games and math libraries
 
+3/14/2023
+    I'll make an attempt to remember what went on since the last time I wrote.
+    I have been very tired but two days ago, I felt the best I had been in two weeks.
+    I've neglected sleep the last two nights though, and we also sprang forward an hour yesterday.
+    2/27
+        Harrison put in an order for an M9A4 hand gun and a AK. The AK is quality. It has wood furniture, which Harrison did not like initially, but I think it has grown on him.
+        He put in this order because there is an impending "assault weapons ban" here in Washington.
+    2/28
+        Harrison had his birthday. I drove him to the airport so that he could see his parents.
+        Right after I dropped him off, I drove straight up to Canada to see Rhys.
+        He has a real matress now in the guest bedroom, which was a gift from his parents.
+        It was much nicer to sleep on and really made me feel like I was in a home, haha.
+        He had finished the kitchen countertops, and the bathtub had been replaced since the last time I was there.
+        I took him in the miata with the top down to Whole Foods to get some cheese and things.
+        He made the comment "I've don't think I've ever driven in the winter with the top down."
+        We learned that night that he does not like blue cheese.
+    3/1
+        I was so tired that day, and getting more tired as time went on, so we drove down to Bellevue that night.
+        In bellevue, we hung out and worked a bit.
+        I pointed out to Rhys that he could move some code from RenderStepped over to Heartbeat.
+        We discovered that Stepped only runs at the physics rate (no faster than 240 hz).
+	        Now we will entierly ignore Stepped on the client, and probably on the server, too, on principle.
+        Rhys tried to use his custom build system to build and push the code. It worked but he didn't think it did.
+            Roblox changed their publish response code, and so it worked, but the response code was not recognized by the build system.
+    3/2 - now
+        Conceptualized a way to prevent lagging due to encode/decode. That is:
+            Copy object first, as it is 5x to 10x faster than encode.
+            Then encode it on the server over several frames.
+            Then decode it on the client over several frames.
+            Resync over the course of several frames.
+        I improved the encode algorithm:
+            It only does debug checking when in studio. This is good for perf.
+            The debug check is breadth first so that it can show you the shortest path to the problem.
+            The internal loop became much cleaner and a bit faster, too.
+        I found a bug in the way we were registering functions and tables:
+            1) not all tables inside a class should be recursively registered automatically
+            2) If there were two paths to the same function, the server might register one path, but the client might register the other path
+            3) attempting to register boolean values LOL.
+        I improved pretty print for debugging. It's been a bit helpful so far, which is nice.
+        I wrote code to convert animations from the edit format to a new fast format
+            The new fast format is more than 3x smaller.
+            Has better memory locality reducing cache misses and improving binary search time.
+            It unitizes the animations, they all play from time 0 to 1.
+        I wrote a new KeyFrameAnimationRender function that makes use of the new animation format, and does everything in CFrames instead of QFrames.
+        The speed up from both of these is on the order of 3x.
+        Re-encoding takes almost no time at all.
+            When we move this code over to the animation editor, we will be keeping the edit format, but we'll probably just convert the edit format into the fast format for playback.
+            It takes 3ms to convert every animation in the game to the fast format right now, so it should be fast enough.
+        I found some bugs in the animations.
+            Sometimes the bone's animation stack counter would not be reset because of an early exiting guard clause.
+            When I wrote the converter, I scaled the time, unitT = (t - t0)/(t1 - t0). I was braindead and wrote v = v/(t1 - t0) instead of v*(t1 - t0).
+            That was a 2.5 hour bug fixing session to turn a / into a *. The embarassing part is that I found it immediately and thought "there's no way that can be wrong."
+        Harrison and I added sway, walk bob, the sprint animation, and the reloading animation, using the new system. It's quite beautiful.
+        Animations are way more powerful now than they were in the previous builds.
+    3/6
+        Some time between then, Alex came up from San Francisco. We had avery good time. Felix came over too on the 6th, the same day Harrison got back from the trip.
+        We went to the gun range. We had a good time. Rhys found a goal at the range and probably unloaded more ammo than most americans do in their lifetimes.
+        Felix apparently had never operated a gun outside of aiming and pulling the trigger. I didn't realize that! So I showed him how to load and operate my little 1911.
+        Alex introduced me to Death Note and it's pretty neat.
+        Felix and I cuddled a bit while we watched a very funny kung fu parody film that Alex had put on.
+        Alex and Felix stayed up very late talking. I went to bed early becaue I was very tired and started crashing.
+        I found out the next morning that Alex drove him home. I'm glad they like each other.
+        
+        Alex and Rhys later left for Canada. Alex later spent the night on his way back from Canada to San Fran.
+
 2/26/2023
     This was a busy day for me, though I did not get much done.
     We are just changing the architecture of the moduleLoader and animations to support a better API.
