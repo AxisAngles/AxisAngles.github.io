@@ -1,0 +1,638 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tape</title>
+<style>
+  body {
+    margin: 0;
+    background: #0e1113;
+    color: #e8ece9;
+    font: 16px/1.5 ui-monospace, monospace;
+  }
+  button {
+    pointer-events: auto;
+    font: inherit;
+    font-size: 14px;
+    color: #0e1113;
+    background: #8df0cc;
+    border: none;
+    border-radius: 999px;
+    padding: 12px 16px;
+  }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    pointer-events: none;
+  }
+  #status {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: 72%;
+    padding: 0 24px;
+    text-align: center;
+    text-shadow: 0 1px 4px #000;
+  }
+  #controls {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 24px;
+    display: none;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .edgeLabel {
+    position: fixed;
+    left: 0;
+    top: 0;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.6);
+    font-size: 14px;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <button id="start">Start AR</button>
+  <div id="status">Needs Chrome on an ARCore-capable Android phone, served over HTTPS.</div>
+</div>
+<div id="controls">
+  <button id="undo">Undo</button>
+  <button id="newPoint">New point</button>
+  <button id="addPolygon">Add polygon</button>
+  <button id="finish">Finish</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const status = document.getElementById('status')
+const startButton = document.getElementById('start')
+
+const scene = new THREE.Scene()
+const camera = new THREE.PerspectiveCamera()
+const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true})
+renderer.setPixelRatio(devicePixelRatio)
+renderer.setSize(innerWidth, innerHeight)
+renderer.xr.enabled = true
+document.body.appendChild(renderer.domElement)
+
+function formatFtIn(m) {
+  const totalInches = m/0.0254
+  const feet = Math.floor(totalInches/12)
+  const inches = totalInches - feet*12
+  return feet > 0 ? `${feet}' ${inches.toFixed(1)}"` : `${inches.toFixed(1)}"`
+}
+
+// ---------- crosshair ----------
+
+const markerGeometry = new THREE.SphereGeometry(0.008, 16, 8)
+const markerMaterial = new THREE.MeshBasicMaterial({color: 0x8df0cc})
+
+const crosshair = new THREE.Mesh(
+  new THREE.RingGeometry(0.008, 0.011, 32),
+  new THREE.MeshBasicMaterial({color: 0x8df0cc})
+)
+scene.add(crosshair)
+
+// diameter = ring thickness (0.011 - 0.008), same 1m projection so they match exactly
+const centerDot = new THREE.Mesh(
+  new THREE.SphereGeometry(0.0015, 12, 6),
+  new THREE.MeshBasicMaterial({color: 0xffffff})
+)
+scene.add(centerDot)
+
+// f'(s) = (g - f)/k, s = arc length of the look vector g's path: time-invariant
+// exponential chase with steady-state lag k radians. Solved per frame in closed
+// form with g linear from gPrev to g:  f(L) = g - k u + (f0 - gPrev + k u) e^(-L/k)
+const k = 0.03
+let f = null
+let gPrev = null
+
+function stepCrosshair() {
+  const g = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2).negate()
+  if (!f) {
+    f = g.clone()
+    gPrev = g
+  }
+  const delta = g.clone().sub(gPrev)
+  const L = delta.length()
+  if (L > 0) {
+    const ku = delta.multiplyScalar(k/L)
+    f = g.clone().sub(ku).add(f.sub(gPrev).add(ku).multiplyScalar(Math.exp(-L/k)))
+  }
+  gPrev = g
+  const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
+  crosshair.position.copy(eye).add(f.clone().normalize())
+  crosshair.lookAt(eye)
+  centerDot.position.copy(eye).add(g)
+}
+
+// ---------- triangulation ----------
+
+// minimize sum of w * |perpendicular residual|^2 over rays {o, d}; d must be unit.
+// pass 1: w = 1 (plain least squares).  pass 2: w = 1/t^2, t = depth along ray,
+// which is Gauss-Newton on the tan^2(theta) angular error.
+function solvePoint(rayList) {
+  let weightList = rayList.map(() => 1)
+  let p, quality, behindCount
+  for (const pass of [0, 1]) {
+    const a = new Array(9).fill(0)
+    const b = new THREE.Vector3()
+    for (let i = 0; i < rayList.length; i += 1) {
+      const {o, d} = rayList[i]
+      const w = weightList[i]
+      const m = [
+        w*(1 - d.x*d.x), -w*d.x*d.y, -w*d.x*d.z,
+        -w*d.y*d.x, w*(1 - d.y*d.y), -w*d.y*d.z,
+        -w*d.z*d.x, -w*d.z*d.y, w*(1 - d.z*d.z),
+      ]
+      for (let j = 0; j < 9; j += 1) a[j] += m[j]
+      b.x += m[0]*o.x + m[1]*o.y + m[2]*o.z
+      b.y += m[3]*o.x + m[4]*o.y + m[5]*o.z
+      b.z += m[6]*o.x + m[7]*o.y + m[8]*o.z
+    }
+    // near-parallel rays make A near-singular: p explodes along the shared direction
+    const Ainv = new THREE.Matrix3().fromArray(a).invert()
+    p = b.clone().applyMatrix3(Ainv)
+    if (pass === 0) {
+      // smallest eigenvalue of unweighted A = parallax strength (0 = no parallax, n = ideal)
+      const v = new THREE.Vector3(1, 2, 3)
+      for (let it = 0; it < 30; it += 1) v.applyMatrix3(Ainv).normalize()
+      quality = 1/v.applyMatrix3(Ainv).length()
+    }
+    behindCount = 0
+    weightList = rayList.map(({o, d}) => {
+      const t = d.dot(p.clone().sub(o))
+      if (t <= 0) behindCount += 1
+      return 1/Math.max(t*t, 0.0025)  // t -> 0 singularity guard, 5cm floor
+    })
+  }
+  return [p, quality, behindCount]
+}
+
+// ---------- edges (rendered segments + label targets) ----------
+
+const MAX_SEGMENTS = 64
+const segmentPositions = new Float32Array(MAX_SEGMENTS*6)
+const segmentGeometry = new THREE.BufferGeometry()
+segmentGeometry.setAttribute('position', new THREE.BufferAttribute(segmentPositions, 3))
+segmentGeometry.setDrawRange(0, 0)
+const segments = new THREE.LineSegments(segmentGeometry, new THREE.LineBasicMaterial({color: 0xffffff}))
+segments.frustumCulled = false
+scene.add(segments)
+let segmentCount = 0
+
+const edgeList = []
+
+function addEdge(a, b, interior = null) {
+  edgeList.push({a, b, interior})
+  segmentPositions.set([a.x, a.y, a.z, b.x, b.y, b.z], segmentCount*6)
+  segmentCount += 1
+  segmentGeometry.setDrawRange(0, segmentCount*2)
+  segmentGeometry.attributes.position.needsUpdate = true
+}
+
+// ---------- modes ----------
+
+let mode = 'idle'
+const buttonVisibility = {
+  idle: ['newPoint', 'addPolygon'],
+  point: ['undo', 'newPoint', 'finish'],
+  polygon: ['undo', 'finish'],
+}
+
+function setMode(m) {
+  mode = m
+  for (const id of ['undo', 'newPoint', 'addPolygon', 'finish'])
+    document.getElementById(id).style.display = buttonVisibility[m].includes(id) ? '' : 'none'
+}
+
+// ---------- point mode ----------
+
+let rayList = []
+let liveMarker = null
+const committedList = []
+const markerList = []
+
+const MAX_RAYS = 32
+const rayPositions = new Float32Array(MAX_RAYS*6)
+const rayGeometry = new THREE.BufferGeometry()
+rayGeometry.setAttribute('position', new THREE.BufferAttribute(rayPositions, 3))
+rayGeometry.setDrawRange(0, 0)
+const rayLines = new THREE.LineSegments(
+  rayGeometry,
+  new THREE.LineBasicMaterial({color: 0x8df0cc, transparent: true, opacity: 0.35})
+)
+rayLines.frustumCulled = false
+scene.add(rayLines)
+
+function refreshRayLines() {
+  for (let i = 0; i < rayList.length; i += 1) {
+    const {o, d} = rayList[i]
+    rayPositions.set([o.x, o.y, o.z, o.x + d.x*5, o.y + d.y*5, o.z + d.z*5], i*6)
+  }
+  rayGeometry.setDrawRange(0, rayList.length*2)
+  rayGeometry.attributes.position.needsUpdate = true
+}
+
+function refreshSolution() {
+  refreshRayLines()
+  if (rayList.length < 2) {
+    if (liveMarker) {
+      scene.remove(liveMarker)
+      liveMarker = null
+    }
+    status.textContent = rayList.length === 0 ? '' : '1 ray - move somewhere else and add another'
+    return
+  }
+  const [p, quality, behindCount] = solvePoint(rayList)
+  if (!liveMarker) {
+    liveMarker = new THREE.Mesh(markerGeometry, markerMaterial)
+    scene.add(liveMarker)
+  }
+  liveMarker.position.copy(p)
+  status.textContent = `${rayList.length} rays · parallax ${quality.toFixed(2)}`
+    + (behindCount > 0 ? ` · ${behindCount} behind camera!` : '')
+}
+
+function addPerspective() {
+  const o = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
+  const d = f.clone().normalize()  // f is non-unit
+  rayList.push({o, d})
+  refreshSolution()
+}
+
+function commitCurrent() {
+  if (!liveMarker) return
+  committedList.push(liveMarker.position.clone())
+  markerList.push(liveMarker)
+  liveMarker = null
+  rayList = []
+  refreshRayLines()
+  status.textContent = `${committedList.length} points`
+}
+
+// ---------- polygon mode ----------
+
+let selectedList = []
+
+const selectionPositions = new Float32Array(32*3)
+const selectionGeometry = new THREE.BufferGeometry()
+selectionGeometry.setAttribute('position', new THREE.BufferAttribute(selectionPositions, 3))
+selectionGeometry.setDrawRange(0, 0)
+const selectionLine = new THREE.Line(
+  selectionGeometry,
+  new THREE.LineBasicMaterial({color: 0x8df0cc, transparent: true, opacity: 0.5})
+)
+selectionLine.frustumCulled = false
+scene.add(selectionLine)
+
+function refreshSelectionLine() {
+  for (let i = 0; i < selectedList.length; i += 1)
+    selectionPositions.set([selectedList[i].x, selectedList[i].y, selectedList[i].z], i*3)
+  selectionGeometry.setDrawRange(0, selectedList.length)
+  selectionGeometry.attributes.position.needsUpdate = true
+}
+
+function getNearestSelectable() {
+  const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
+  const d = f.clone().normalize()
+  let best = null
+  let bestAngle = 0.08  // rad pick radius
+  for (let i = 0; i < committedList.length; i += 1) {
+    if (selectedList.includes(committedList[i])) continue
+    const angle = d.angleTo(committedList[i].clone().sub(eye))
+    if (angle < bestAngle) {
+      best = i
+      bestAngle = angle
+    }
+  }
+  return best
+}
+
+function updatePointHighlight() {
+  const nearest = mode === 'polygon' ? getNearestSelectable() : null
+  for (let i = 0; i < markerList.length; i += 1)
+    markerList[i].scale.setScalar(i === nearest ? 2 : 1)
+}
+
+function selectPoint() {
+  const i = getNearestSelectable()
+  if (i === null) return
+  selectedList.push(committedList[i])
+  refreshSelectionLine()
+  status.textContent = `${selectedList.length} vertices`
+}
+
+// least squares plane: centroid + smallest covariance eigenvector, found as the
+// dominant eigenvector of (tr C)I - C so exactly-coplanar input needs no inversion
+function fitPlane(pointList) {
+  const c = new THREE.Vector3()
+  for (const p of pointList) c.add(p)
+  c.divideScalar(pointList.length)
+  let xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0
+  for (const p of pointList) {
+    const r = p.clone().sub(c)
+    xx += r.x*r.x; xy += r.x*r.y; xz += r.x*r.z
+    yy += r.y*r.y; yz += r.y*r.z; zz += r.z*r.z
+  }
+  const tr = xx + yy + zz
+  // colinear input leaves two near-zero eigenvalues: normal direction is arbitrary
+  const n = new THREE.Vector3(1, 2, 3)
+  for (let it = 0; it < 40; it += 1) {
+    n.set(
+      tr*n.x - (xx*n.x + xy*n.y + xz*n.z),
+      tr*n.y - (xy*n.x + yy*n.y + yz*n.z),
+      tr*n.z - (xz*n.x + yz*n.y + zz*n.z),
+    ).normalize()
+  }
+  return [c, n]
+}
+
+const fillMaterial = new THREE.MeshBasicMaterial({
+  color: 0x8df0cc,
+  transparent: true,
+  opacity: 0.1,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+})
+
+function finishPolygon() {
+  const n = selectedList.length
+  if (n === 2) {
+    // degenerate polygon: a pure edge, no fitting needed
+    addEdge(selectedList[0], selectedList[1])
+    status.textContent = formatFtIn(selectedList[0].distanceTo(selectedList[1]))
+  }
+  if (n >= 3) {
+    const [c, normal] = fitPlane(selectedList)
+    const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
+    if (normal.dot(eye.clone().sub(c)) < 0) normal.negate()  // camera on the front side
+    const flatList = selectedList.map(
+      p => p.clone().sub(normal.clone().multiplyScalar(p.clone().sub(c).dot(normal)))
+    )
+    for (let i = 0; i < n; i += 1) addEdge(flatList[i], flatList[(i + 1) % n], c)
+    // 2D basis in the plane for triangulation; self-intersecting outlines triangulate wrong
+    const u = new THREE.Vector3().crossVectors(
+      normal,
+      Math.abs(normal.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)
+    ).normalize()
+    const w = new THREE.Vector3().crossVectors(normal, u)
+    const flat2D = flatList.map(
+      p => new THREE.Vector2(p.clone().sub(c).dot(u), p.clone().sub(c).dot(w))
+    )
+    const triList = THREE.ShapeUtils.triangulateShape(flat2D, [])
+    const fillGeometry = new THREE.BufferGeometry().setFromPoints(flatList)
+    fillGeometry.setIndex(triList.flat())
+    scene.add(new THREE.Mesh(fillGeometry, fillMaterial))
+    status.textContent = `${n}-gon flattened`
+  }
+  selectedList = []
+  refreshSelectionLine()
+}
+
+// ---------- edge labels ----------
+
+let shownEdge = null
+const labelList = []
+
+function viewToPx(v, P) {
+  return [
+    ((P[0]*(v.x/-v.z) - P[8]) + 1)/2*innerWidth,
+    (1 - (P[5]*(v.y/-v.z) - P[9]))/2*innerHeight,
+  ]
+}
+
+// closest screen approach via the vanishing-point form: the image of line point
+// p is q(p) = q_VP + u/depth(p), where u = the line's piercing point of the
+// camera plane (z = 0), so a behind-camera endpoint never enters a divide.
+// the visible image is the segment between both projected endpoints, or - one
+// endpoint behind - the ray from the front endpoint's image along u.
+// returns [qx, qy, distPx, tieAngle, ex, ey], (ex, ey) = screen edge direction
+function edgeApproachPx(edge, cam, cx, cy) {
+  const va = edge.a.clone().applyMatrix4(cam.matrixWorldInverse)
+  const vb = edge.b.clone().applyMatrix4(cam.matrixWorldInverse)
+  const aFront = va.z < -1e-6
+  const bFront = vb.z < -1e-6
+  if (!aFront && !bFront) return null
+  const P = cam.projectionMatrix.elements
+  let ax, ay, ex, ey, tMax  // visible image: (ax, ay) + t(ex, ey), 0 <= t <= tMax
+  if (aFront && bFront) {
+    ;[ax, ay] = viewToPx(va, P)
+    const [bx, by] = viewToPx(vb, P)
+    ex = bx - ax
+    ey = by - ay
+    tMax = 1
+  } else {
+    const front = aFront ? va : vb
+    const d = vb.clone().sub(va)
+    const ux = va.x - d.x*(va.z/d.z)  // camera-plane piercing point, sign-invariant in d
+    const uy = va.y - d.y*(va.z/d.z)
+    ;[ax, ay] = viewToPx(front, P)
+    ex = P[0]*ux*innerWidth/2
+    ey = -P[5]*uy*innerHeight/2
+    tMax = Infinity
+  }
+  const lenSq = ex*ex + ey*ey
+  if (lenSq < 1e-9) return null  // edge seen end-on
+  const tRaw = ((cx - ax)*ex + (cy - ay)*ey)/lenSq
+  const t = Math.max(0, Math.min(tMax, tRaw))
+  const qx = ax + t*ex, qy = ay + t*ey
+  const dist = Math.hypot(cx - qx, cy - qy)
+  // a clamped t lands on a real vertex: tangent tie-break, measured into the edge
+  let tieAngle = 0
+  if (t !== tRaw) {
+    const inx = t === 0 ? ex : -ex
+    const iny = t === 0 ? ey : -ey
+    tieAngle = Math.acos(Math.max(-1, Math.min(1,
+      ((cx - qx)*inx + (cy - qy)*iny)/Math.max(dist*Math.sqrt(lenSq), 1e-9))))
+  }
+  return [qx, qy, dist, tieAngle, ex, ey]
+}
+
+function spawnLabel(edge) {
+  const el = document.createElement('div')
+  el.className = 'edgeLabel'
+  el.textContent = formatFtIn(edge.a.distanceTo(edge.b))
+  document.body.appendChild(el)
+  const label = {edge, el, offsetX: 0, offsetY: 0, velX: 0, velY: 0, fading: false, fresh: true}
+  labelList.push(label)
+  requestAnimationFrame(() => el.style.opacity = 1)
+}
+
+function updateEdgeLabels(dt) {
+  const xrCamera = renderer.xr.getCamera(camera)
+  const cam = xrCamera.cameras && xrCamera.cameras.length > 0 ? xrCamera.cameras[0] : camera
+  const cx = innerWidth/2, cy = innerHeight/2
+  const P = cam.projectionMatrix.elements
+
+  let bestEdge = null
+  let bestDist = 130  // px show threshold
+  let bestAngle = Infinity
+  for (const edge of edgeList) {
+    const approach = edgeApproachPx(edge, cam, cx, cy)
+    if (!approach) continue
+    const dist = approach[2], tieAngle = approach[3]
+    if (dist < bestDist - 0.5 || (dist < bestDist + 0.5 && tieAngle < bestAngle)) {
+      bestDist = dist
+      bestAngle = tieAngle
+      bestEdge = edge
+    }
+  }
+
+  if (bestEdge !== shownEdge) {
+    for (const label of labelList) {
+      if (label.fading) continue
+      label.fading = true
+      label.el.style.opacity = 0
+      setTimeout(() => {
+        label.el.remove()
+        labelList.splice(labelList.indexOf(label), 1)
+      }, 220)
+    }
+    if (bestEdge) spawnLabel(bestEdge)
+    shownEdge = bestEdge
+  }
+
+  for (const label of labelList) {
+    const approach = edgeApproachPx(label.edge, cam, cx, cy)
+    if (!approach) continue
+    const [qx, qy, , , ex, ey] = approach
+    // polygon edges label on the outside: the edge orthogonal pointing away from
+    // the interior. lone edges (or interior behind camera): opposite the crosshair
+    const eLen = Math.sqrt(ex*ex + ey*ey)
+    let awayX = -ey/eLen, awayY = ex/eLen
+    let interiorPx = null
+    if (label.edge.interior) {
+      const iv = label.edge.interior.clone().applyMatrix4(cam.matrixWorldInverse)
+      if (iv.z < -1e-6) interiorPx = viewToPx(iv, P)
+    }
+    if (interiorPx) {
+      if ((interiorPx[0] - qx)*awayX + (interiorPx[1] - qy)*awayY > 0) {
+        awayX = -awayX
+        awayY = -awayY
+      }
+    } else {
+      const dx = cx - qx, dy = cy - qy
+      const dLen = Math.hypot(dx, dy)
+      if (dLen > 1) {
+        awayX = -dx/dLen
+        awayY = -dy/dLen
+      } else {
+        awayX = 0
+        awayY = 1
+      }
+    }
+    // box sits on the away side: its support vertex along -away is pinned
+    // K_GAP out from the closest point, so the box never crosses the edge
+    const K_GAP = 26
+    const w = label.el.offsetWidth, h = label.el.offsetHeight
+    const targetX = awayX*K_GAP + Math.sign(awayX)*w/2
+    const targetY = awayY*K_GAP + Math.sign(awayY)*h/2
+    if (label.fresh) {
+      label.offsetX = targetX
+      label.offsetY = targetY
+      label.fresh = false
+    }
+    // critically damped spring on the total offset; the closest point itself is raw
+    const omega = 18
+    label.velX += (omega*omega*(targetX - label.offsetX) - 2*omega*label.velX)*dt
+    label.velY += (omega*omega*(targetY - label.offsetY) - 2*omega*label.velY)*dt
+    label.offsetX += label.velX*dt
+    label.offsetY += label.velY*dt
+    label.el.style.transform =
+      `translate(${qx + label.offsetX - w/2}px, ${qy + label.offsetY - h/2}px)`
+  }
+}
+
+// ---------- controls ----------
+
+function newPointPressed() {
+  if (mode === 'idle') {
+    setMode('point')
+    status.textContent = 'Aim and tap the screen from 2+ spots.'
+    return
+  }
+  commitCurrent()
+}
+
+function addPolygonPressed() {
+  setMode('polygon')
+  selectedList = []
+  status.textContent = 'Aim at a point and tap the screen to add it.'
+}
+
+function finishPressed() {
+  if (mode === 'point') {
+    commitCurrent()
+    rayList = []
+    refreshRayLines()
+  }
+  if (mode === 'polygon') finishPolygon()
+  setMode('idle')
+}
+
+function undoPressed() {
+  if (mode === 'point') {
+    rayList.pop()
+    refreshSolution()
+  }
+  if (mode === 'polygon') {
+    selectedList.pop()
+    refreshSelectionLine()
+  }
+}
+
+async function start() {
+  if (!navigator.xr || !await navigator.xr.isSessionSupported('immersive-ar')) {
+    status.textContent = 'immersive-ar not supported here - open in Chrome on an ARCore phone, over HTTPS.'
+    return
+  }
+  const session = await navigator.xr.requestSession('immersive-ar', {
+    requiredFeatures: ['dom-overlay'],
+    domOverlay: {root: document.body},
+  })
+  renderer.xr.setReferenceSpaceType('local')
+  await renderer.xr.setSession(session)
+  startButton.style.display = 'none'
+  document.getElementById('controls').style.display = 'flex'
+  document.getElementById('undo').addEventListener('click', undoPressed)
+  document.getElementById('newPoint').addEventListener('click', newPointPressed)
+  document.getElementById('addPolygon').addEventListener('click', addPolygonPressed)
+  document.getElementById('finish').addEventListener('click', finishPressed)
+  window.addEventListener('click', e => {
+    if (e.target.tagName === 'BUTTON') return
+    if (mode === 'point') addPerspective()
+    if (mode === 'polygon') selectPoint()
+  })
+  setMode('idle')
+  status.textContent = 'New point to start measuring.'
+  session.addEventListener('end', () => location.reload())
+  let prevTime = null
+  renderer.setAnimationLoop(time => {
+    const dt = prevTime === null ? 0.016 : Math.min((time - prevTime)/1000, 0.05)
+    prevTime = time
+    stepCrosshair()
+    updatePointHighlight()
+    updateEdgeLabels(dt)
+    renderer.render(scene, camera)
+  })
+}
+
+startButton.addEventListener('click', () => start().catch(err => status.textContent = err))
+</script>
+</body>
+</html>
