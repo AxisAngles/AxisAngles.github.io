@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Savings</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Spectral:ital,wght@0,400;0,600;1,400&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #eef3ec;
+    --ink: #1f3a2e;
+    --muted: #6e8577;
+    --rule: #c9d8cc;
+    --red: #b23a2e;
+    --green: #3f7d5c;
+    --amber: #95660f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14201a;
+      --ink: #e4ece5;
+      --muted: #83998b;
+      --rule: #2a3a31;
+      --red: #e0786b;
+      --green: #7cc39b;
+      --amber: #d9a94a;
+    }
+  }
+
+  body {
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: 3rem 1.25rem;
+    background: var(--paper);
+    color: var(--ink);
+    font: 1.0625rem/1.6 Spectral, Georgia, serif;
+  }
+
+  #balance {
+    margin: 0;
+    font: 500 clamp(2rem, 9vw, 3.75rem)/1.1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: -0.02em;
+  }
+  #balance span { color: var(--muted); }
+  #status { margin: 0.5rem 0 2.5rem; color: var(--muted); font-style: italic; }
+
+  #list { margin-top: 2.5rem; font: clamp(0.8125rem, 2.8vw, 0.9375rem) "IBM Plex Mono", ui-monospace, monospace; }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.1fr) 4.25rem; /* minmax(0, …) keeps columns aligned across rows */
+    gap: 0.5rem;
+    align-items: center;
+    min-height: 2.75rem;
+    padding: 0 0.5rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .row > :nth-child(3) { text-align: right; }
+  div.row { cursor: pointer; }
+  div.row:hover { background: var(--rule); }
+  .Deposit { color: var(--green); }
+  .Withdrawal { color: var(--red); }
+  .Rate { color: var(--amber); }
+
+  input, select, button {
+    min-width: 0;
+    font: inherit;
+    padding: 0.3rem 0.4rem;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+  }
+  button { background: var(--green); border-color: var(--green); color: var(--paper); cursor: pointer; }
+  button[type=button] { background: none; border-color: transparent; color: var(--muted); }
+  .row > span:last-child { display: flex; justify-content: flex-end; }
+</style>
+</head>
+<body>
+
+<h1 id="balance"></h1>
+<p id="status"></p>
+
+<canvas id="chart"></canvas>
+
+<div id="list"></div>
+
+<script>
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx7jfnbbERiq-e87RGmp57wZ2BGLdStbQ52RACod_rgIx0reeMze2sYSr_7BoY7lsVp0Q/exec' // Deploy → Web app in the sheet's Apps Script
+const YEAR = 365*24*60*60*1000
+const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+const liveMoney = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 6, maximumFractionDigits: 6 })
+const kinds = ['Deposit', 'Withdrawal', 'Rate'] // must match the Type column in the sheet
+
+const balanceEl = document.getElementById('balance')
+const statusEl = document.getElementById('status')
+const list = document.getElementById('list')
+
+const events = []
+let editing = 0 // index of the row open for editing; events.length is the blank row for adding
+
+// between events the balance grows by (1 + APY)^years, so a full year at a fixed rate matches the bank's APY exactly
+function getBalance(time) {
+  let balance = 0
+  let apy = 0 // percent
+  let lastTime = 0
+  for (const e of events) {
+    if (e.time > time) break
+    balance *= (1 + apy/100)**((e.time - lastTime)/YEAR)
+    lastTime = e.time
+    if (e.kind === 'Rate') apy = e.value
+    if (e.kind === 'Deposit') balance += e.value
+    if (e.kind === 'Withdrawal') balance -= e.value
+  }
+  return [balance*(1 + apy/100)**((time - lastTime)/YEAR), apy]
+}
+
+Chart.defaults.color = '#6e8577'
+Chart.defaults.borderColor = 'rgba(110, 133, 119, 0.25)'
+Chart.defaults.font.family = "'IBM Plex Mono', monospace"
+
+const chart = new Chart(document.getElementById('chart'), {
+  type: 'line',
+  data: { datasets: [{ data: [], borderColor: '#3f7d5c', backgroundColor: 'rgba(63, 125, 92, 0.15)', fill: 'origin', pointRadius: 0 }] },
+  options: {
+    animation: false,
+    interaction: { mode: 'nearest', axis: 'x', intersect: false },
+    scales: {
+      x: { type: 'linear', ticks: { maxTicksLimit: 6, callback: t => new Date(t).toLocaleDateString() } },
+      y: { ticks: { callback: money.format } },
+    },
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: {
+        title: items => new Date(items[0].parsed.x).toLocaleDateString(),
+        label: item => money.format(item.parsed.y),
+      } },
+    },
+  },
+})
+
+function render() {
+  list.innerHTML = [...events, null].map((e, i) => {
+    if (i === editing) return `
+      <form class="row">
+        <input name="date" type="date" required value="${new Date(e?.time ?? Date.now()).toLocaleDateString('en-CA')}">
+        <select name="kind">
+          ${kinds.map(kind => `<option ${kind === e?.kind ? 'selected' : ''}>${kind}</option>`).join('')}
+        </select>
+        <input name="value" type="number" step="any" min="0" required placeholder="Amount" value="${e?.value ?? ''}">
+        <span>
+          <button>${e ? 'Save' : 'Add'}</button>
+          ${e ? '<button type="button" onclick="deleteEvent()" title="Delete">✕</button>' : ''}
+        </span>
+      </form>`
+    if (!e) return ''
+    return `
+      <div class="row ${e.kind}" onclick="editEvent(${i})">
+        <span>${new Date(e.time).toLocaleDateString(undefined, { dateStyle: 'medium' })}</span>
+        <span>${e.kind}</span>
+        <span>${e.kind === 'Rate' ? `${e.value}%` : money.format(e.value)}</span>
+      </div>`
+  }).join('')
+
+  const now = Date.now()
+  const start = events[0]?.time ?? now
+  const times = Array.from({ length: 300 }, (_, i) => start + (now - start)*i/299)
+    .concat(events.flatMap(e => [e.time - 1, e.time])) // both sides of each deposit jump
+    .filter(t => t <= now)
+    .sort((a, b) => a - b)
+  chart.data.datasets[0].data = times.map(t => ({ x: t, y: getBalance(t)[0] }))
+  chart.update()
+}
+
+// every page on username.github.io shares one localStorage, so the key is specific
+async function save() {
+  const password = localStorage.getItem('savings-password') ?? prompt('Password to save changes')
+  const response = await fetch(SCRIPT_URL, {
+    method: 'POST', // no Content-Type header, so the browser skips the CORS preflight that Apps Script can't answer
+    body: JSON.stringify({ password, rows: events.map(e => [new Date(e.time).toLocaleDateString('en-CA'), e.kind, e.value]) }),
+  })
+  if (await response.text() !== 'ok') {
+    localStorage.removeItem('savings-password')
+    alert('Wrong password, nothing was saved.')
+    return location.reload()
+  }
+  localStorage.setItem('savings-password', password)
+}
+
+// inline onclick runs with the element and its form in scope, so avoid names like `remove` or `submit`
+function editEvent(i) {
+  editing = i
+  render()
+}
+
+function deleteEvent() {
+  events.splice(editing, 1)
+  editing = events.length
+  render()
+  save()
+}
+
+list.onsubmit = e => {
+  e.preventDefault()
+  const { date, kind, value } = Object.fromEntries(new FormData(e.target))
+  events[editing] = { time: new Date(date + 'T00:00').getTime(), kind, value: +value } // 'T00:00' parses as local midnight; a bare date parses as UTC
+  events.sort((a, b) => a.time - b.time)
+  editing = events.length
+  render()
+  save()
+}
+
+setInterval(() => {
+  const [balance, apy] = getBalance(Date.now())
+  const text = liveMoney.format(balance)
+  balanceEl.innerHTML = `${text.slice(0, -4)}<span>${text.slice(-4)}</span>`
+  statusEl.textContent = `${new Date().toLocaleDateString(undefined, { dateStyle: 'full' })}, earning ${apy}% APY`
+}, 100)
+
+fetch(SCRIPT_URL).then(response => response.json()).then(rows => {
+  for (const [date, kind, value] of rows) events.push({ time: new Date(date + 'T00:00').getTime(), kind, value })
+  events.sort((a, b) => a.time - b.time)
+  editing = events.length
+  render()
+})
+</script>
+</body>
+</html>
