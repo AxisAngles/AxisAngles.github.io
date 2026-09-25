@@ -87,10 +87,11 @@
 <div id="list"></div>
 
 <script>
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx7jfnbbERiq-e87RGmp57wZ2BGLdStbQ52RACod_rgIx0reeMze2sYSr_7BoY7lsVp0Q/exec' // Deploy → Web app in the sheet's Apps Script
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbx7jfnbbERiq-e87RGmp57wZ2BGLdStbQ52RACod_rgIx0reeMze2sYSr_7BoY7lsVp0Q/exec'
 const YEAR = 365*24*60*60*1000
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
 const liveMoney = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 6, maximumFractionDigits: 6 })
+const percent = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 3 })
 const kinds = ['Deposit', 'Withdrawal', 'Rate'] // must match the Type column in the sheet
 
 const balanceEl = document.getElementById('balance')
@@ -98,22 +99,22 @@ const statusEl = document.getElementById('status')
 const list = document.getElementById('list')
 
 const events = []
-let editing = 0 // index of the row open for editing; events.length is the blank row for adding
+let editing = 0 // index of the row open for editing; events.length is the blank row for adding, shown at the top
 
 // between events the balance grows by (1 + APY)^years, so a full year at a fixed rate matches the bank's APY exactly
 function getBalance(time) {
   let balance = 0
-  let apy = 0 // percent
+  let apy = 0
   let lastTime = 0
   for (const e of events) {
     if (e.time > time) break
-    balance *= (1 + apy/100)**((e.time - lastTime)/YEAR)
+    balance *= (1 + apy)**((e.time - lastTime)/YEAR)
     lastTime = e.time
     if (e.kind === 'Rate') apy = e.value
     if (e.kind === 'Deposit') balance += e.value
     if (e.kind === 'Withdrawal') balance -= e.value
   }
-  return [balance*(1 + apy/100)**((time - lastTime)/YEAR), apy]
+  return [balance*(1 + apy)**((time - lastTime)/YEAR), apy]
 }
 
 Chart.defaults.color = '#6e8577'
@@ -141,14 +142,15 @@ const chart = new Chart(document.getElementById('chart'), {
 })
 
 function render() {
-  list.innerHTML = [...events, null].map((e, i) => {
+  list.innerHTML = [events.length, ...events.keys()].map(i => {
+    const e = events[i]
     if (i === editing) return `
       <form class="row">
         <input name="date" type="date" required value="${new Date(e?.time ?? Date.now()).toLocaleDateString('en-CA')}">
         <select name="kind">
           ${kinds.map(kind => `<option ${kind === e?.kind ? 'selected' : ''}>${kind}</option>`).join('')}
         </select>
-        <input name="value" type="number" step="any" min="0" required placeholder="Amount" value="${e?.value ?? ''}">
+        <input name="value" type="number" step="any" min="0" required placeholder="Amount" value="${e?.kind === 'Rate' ? +(e.value*100).toPrecision(10) : e?.value ?? ''}">
         <span>
           <button>${e ? 'Save' : 'Add'}</button>
           ${e ? '<button type="button" onclick="deleteEvent()" title="Delete">✕</button>' : ''}
@@ -159,7 +161,7 @@ function render() {
       <div class="row ${e.kind}" onclick="editEvent(${i})">
         <span>${new Date(e.time).toLocaleDateString(undefined, { dateStyle: 'medium' })}</span>
         <span>${e.kind}</span>
-        <span>${e.kind === 'Rate' ? `${e.value}%` : money.format(e.value)}</span>
+        <span>${e.kind === 'Rate' ? percent.format(e.value) : money.format(e.value)}</span>
       </div>`
   }).join('')
 
@@ -204,7 +206,11 @@ function deleteEvent() {
 list.onsubmit = e => {
   e.preventDefault()
   const { date, kind, value } = Object.fromEntries(new FormData(e.target))
-  events[editing] = { time: new Date(date + 'T00:00').getTime(), kind, value: +value } // 'T00:00' parses as local midnight; a bare date parses as UTC
+  events[editing] = {
+    time: new Date(date + 'T00:00').getTime(), // 'T00:00' parses as local midnight; a bare date parses as UTC
+    kind,
+    value: kind === 'Rate' ? value/100 : +value, // the box takes 3.3 for 3.3%; the sheet stores 3.3% as 0.033
+  }
   events.sort((a, b) => a.time - b.time)
   editing = events.length
   render()
@@ -215,7 +221,7 @@ setInterval(() => {
   const [balance, apy] = getBalance(Date.now())
   const text = liveMoney.format(balance)
   balanceEl.innerHTML = `${text.slice(0, -4)}<span>${text.slice(-4)}</span>`
-  statusEl.textContent = `${new Date().toLocaleDateString(undefined, { dateStyle: 'full' })}, earning ${apy}% APY`
+  statusEl.textContent = `${new Date().toLocaleDateString(undefined, { dateStyle: 'full' })}, earning ${percent.format(apy)} APY`
 }, 100)
 
 fetch(SCRIPT_URL).then(response => response.json()).then(rows => {
